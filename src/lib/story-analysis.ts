@@ -180,11 +180,11 @@ function finalize(payload: GeminiStoryResult, missingEvidence: string[]): Editor
 export async function analyzeStory(input: {
   video: VideoMetadata;
   frames: FrameDetections[];
-  frameFiles: { timestamp: number; path: string }[];
+  frameImages: { timestamp: number; data: string; mimeType?: string }[];
   stats: VisualStats;
   sceneCuts: SceneCut[];
   audio: AudioInsights | null;
-  audioPath?: string;
+  audioInline?: { mimeType: string; data: string };
   caption?: string;
   warnings: string[];
 }): Promise<{
@@ -195,7 +195,9 @@ export async function analyzeStory(input: {
 }> {
   const missing: string[] = [];
   if (!input.video.hasAudio) missing.push("The file has no audio track.");
-  if (input.video.hasAudio && !input.audioPath) missing.push("Audio extraction failed, so speech was not sent to Gemini.");
+  if (input.video.hasAudio && !input.audioInline?.data) {
+    missing.push("Audio extraction failed, so speech was not sent to Gemini.");
+  }
   if (!input.caption) missing.push("No publish caption was provided.");
 
   const geminiKey = process.env.GEMINI_API_KEY?.trim();

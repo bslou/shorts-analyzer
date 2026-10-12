@@ -6,6 +6,7 @@ import { AppHeader } from "@/components/AppHeader";
 import { readVideoMeta } from "@/lib/client-validate";
 import { adaptiveFrameTarget, estimateAnalysisCost } from "@/lib/cost";
 import { formatDuration } from "@/lib/format";
+import { runBrowserAnalysis } from "@/lib/client-analyze";
 import { fileFingerprint, getCachedAnalysis, rememberSessionVideo, storeAnalysis } from "@/lib/session";
 import type { AnalysisStage, BudgetEstimate, ProgressEvent } from "@/lib/types";
 
@@ -26,6 +27,8 @@ type Status = {
   geminiModel?: string;
   geminiMaxFrames?: number;
   frameIntervalSeconds?: number;
+  hookSeconds?: number;
+  hookIntervalSeconds?: number;
   minRoboflowFrames?: number;
   maxRoboflowFrames?: number;
   softBudgetUsd?: number;
@@ -127,59 +130,43 @@ export function HomePage() {
     setBusy(true);
     setError(null);
     setBudgetBlock(null);
-    setStage("uploading");
-    setStageMessage("Uploading video");
+    setStage("extracting_frames");
+    setStageMessage("Extracting JPEG frames in the browser");
     setFrameProgress(null);
 
-    const body = new FormData();
-    body.append("video", file);
-    if (caption.trim()) body.append("caption", caption.trim());
-    if (force) body.append("force", "1");
-    if (approveOverBudget) body.append("approveOverBudget", "1");
-
     try {
-      const response = await fetch("/api/analyze", { method: "POST", body });
-      if (!response.body) throw new Error("No response stream from server.");
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() ?? "";
-        for (const chunk of chunks) {
-          const line = chunk.split("\n").find((item) => item.startsWith("data: "));
-          if (!line) continue;
-          const event = JSON.parse(line.slice(6)) as ProgressEvent;
+      if (!status) throw new Error("Server status is not available yet. Refresh and try again.");
+      const result = await runBrowserAnalysis({
+        file,
+        videoUrl: preview.url,
+        caption: caption.trim(),
+        force,
+        approveOverBudget,
+        status,
+        onEvent: (event: ProgressEvent) => {
           if (event.type === "stage") {
             setStage(event.stage);
             setStageMessage(event.message);
           } else if (event.type === "progress") {
             setStage(event.stage);
             setFrameProgress({ completed: event.completed, total: event.total });
-            setStageMessage(`Roboflow inference ${event.completed}/${event.total} frames`);
-          } else if (event.type === "error") {
-            if (event.code === "budget" && event.estimate) {
-              setBudgetBlock(event.estimate);
-              setBusy(false);
-              setStage(null);
-              return;
+            if (event.stage === "roboflow") {
+              setStageMessage(`Roboflow inference ${event.completed}/${event.total} frames`);
             }
-            throw new Error(event.message);
-          } else if (event.type === "complete") {
-            const url = await rememberSessionVideo(file, fileFingerprint(file));
-            storeAnalysis(event.result, url, fileFingerprint(file));
-            router.push("/analysis");
-            return;
           }
-        }
-        if (done) break;
-      }
-      throw new Error("Analysis ended without results.");
+        },
+      });
+      const url = await rememberSessionVideo(file, fileFingerprint(file));
+      storeAnalysis(result, url, fileFingerprint(file));
+      router.push("/analysis");
     } catch (caught) {
+      const extra = caught as Error & { code?: "budget"; estimate?: BudgetEstimate };
+      if (extra.code === "budget" && extra.estimate) {
+        setBudgetBlock(extra.estimate);
+        setBusy(false);
+        setStage(null);
+        return;
+      }
       setError(caught instanceof Error ? caught.message : "Analysis failed.");
       setBusy(false);
       setStage(null);
@@ -196,9 +183,10 @@ export function HomePage() {
             Analyze YouTube Shorts with real computer vision
           </h1>
           <p className="mt-4 max-w-xl text-muted leading-7">
-            Upload a vertical MP4. Roboflow detects objects on sampled frames. Gemini Flash then
-            reads those detections with the opening, transitions, ending, and audio to give
-            format-aware, timestamped editing notes.
+            Choose a vertical MP4. Frames and the complete audio track are extracted in your
+            browser — the original file is never uploaded. Roboflow detects objects on sampled
+            JPEGs. Gemini then reviews those detections with the opening, transitions, ending,
+            and full audio.
           </p>
         </div>
 
@@ -387,7 +375,8 @@ export function HomePage() {
 
         <p className="mt-6 text-xs text-muted">
           Typical Short: 24–36 adaptive Roboflow frames plus one Gemini 2.5 Flash request with full
-          audio. Unchanged files reuse local cache. Object boxes come only from Roboflow.
+          audio. JPEG batches stay under Vercel Hobby&apos;s 4.5MB limit. Unchanged files reuse
+          cache. Object boxes come only from Roboflow.
         </p>
       </main>
     </div>

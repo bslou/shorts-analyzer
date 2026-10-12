@@ -18,6 +18,8 @@ export async function GET() {
       geminiModel: gemini.model,
       geminiMaxFrames: gemini.maxFrames,
       frameIntervalSeconds: config.intervalSeconds,
+      hookSeconds: config.hookSeconds,
+      hookIntervalSeconds: config.hookIntervalSeconds,
       minRoboflowFrames: config.minFrames,
       maxRoboflowFrames: config.maxFrames,
       softBudgetUsd: budget.softBudgetUsd,

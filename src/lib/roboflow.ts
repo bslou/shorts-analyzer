@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { getRoboflowConfig } from "./config";
+import { stripDataUrl } from "./payload";
 import type { Detection, FrameDetections } from "./types";
 
 type WorkflowPrediction = {
@@ -114,6 +115,25 @@ export async function inferFrame(
   }
 
   const bytes = await readFile(framePath);
+  return inferFrameFromBase64(bytes.toString("base64"), frameSize);
+}
+
+export async function inferFrameFromBase64(
+  imageBase64: string,
+  frameSize: { width: number; height: number },
+): Promise<{
+  detections: Detection[];
+  imageWidth: number;
+  imageHeight: number;
+  inferenceId?: string;
+}> {
+  const config = getRoboflowConfig();
+  if (!config.apiKey) {
+    throw new Error(
+      "ROBOFLOW_API_KEY is not set. Add it to .env.local. Get a key from https://app.roboflow.com/settings/api",
+    );
+  }
+
   const url = new URL(config.endpoint);
   url.searchParams.set("api_key", config.apiKey);
 
@@ -128,7 +148,7 @@ export async function inferFrame(
       inputs: {
         image: {
           type: "base64",
-          value: bytes.toString("base64"),
+          value: stripDataUrl(imageBase64),
         },
       },
     }),

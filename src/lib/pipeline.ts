@@ -280,11 +280,19 @@ export async function* runAnalysis(
       story = await analyzeStory({
         video,
         frames: detections,
-        frameFiles,
+        frameImages: await Promise.all(
+          frameFiles.map(async (frame) => ({
+            timestamp: frame.timestamp,
+            data: (await readFile(frame.path)).toString("base64"),
+            mimeType: "image/jpeg",
+          })),
+        ),
         stats: visualStats,
         sceneCuts,
         audio,
-        audioPath,
+        audioInline: audioPath
+          ? { mimeType: "audio/mpeg", data: (await readFile(audioPath)).toString("base64") }
+          : undefined,
         caption,
         warnings,
       });

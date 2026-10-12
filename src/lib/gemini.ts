@@ -1,5 +1,6 @@
-import { readFile, stat } from "node:fs/promises";
 import { getGeminiConfig } from "./config";
+import { stripDataUrl } from "./payload";
+import { pickGeminiFrames } from "./pick-frames";
 import { QuotaError } from "./roboflow";
 import type {
   AudioInsights,
@@ -65,46 +66,6 @@ type GeminiResponse = {
   };
   error?: { message?: string; status?: string; code?: number };
 };
-
-function nearestFrameIndex(frames: { timestamp: number }[], target: number) {
-  let best = 0;
-  let bestDist = Infinity;
-  frames.forEach((frame, index) => {
-    const dist = Math.abs(frame.timestamp - target);
-    if (dist < bestDist) {
-      best = index;
-      bestDist = dist;
-    }
-  });
-  return best;
-}
-
-export function pickGeminiFrames<T extends { timestamp: number; path: string }>(
-  frames: T[],
-  maxFrames: number,
-  extraTimestamps: number[] = [],
-) {
-  if (frames.length <= maxFrames) return frames;
-  const wanted = new Set<number>();
-  wanted.add(0);
-  wanted.add(frames.length - 1);
-  for (let i = 0; i < frames.length && frames[i].timestamp <= 5; i += 1) {
-    if (wanted.size < Math.min(4, maxFrames)) wanted.add(i);
-  }
-  for (const timestamp of extraTimestamps) {
-    if (wanted.size >= maxFrames) break;
-    wanted.add(nearestFrameIndex(frames, timestamp));
-  }
-  const evenCount = maxFrames;
-  for (let i = 0; i < evenCount && wanted.size < maxFrames; i += 1) {
-    const index = Math.round((i * (frames.length - 1)) / Math.max(evenCount - 1, 1));
-    wanted.add(index);
-  }
-  return [...wanted]
-    .sort((a, b) => a - b)
-    .slice(0, maxFrames)
-    .map((index) => frames[index]);
-}
 
 function compactDetections(frames: FrameDetections[]) {
   return frames.map((frame) => ({
@@ -206,11 +167,11 @@ Suggest an alternative opening hook only if the current opening is weak and you 
 export async function analyzeWithGemini(input: {
   video: VideoMetadata;
   frames: FrameDetections[];
-  frameFiles: { timestamp: number; path: string }[];
+  frameImages: { timestamp: number; data: string; mimeType?: string }[];
   stats: VisualStats;
   sceneCuts: SceneCut[];
   audio: AudioInsights | null;
-  audioPath?: string;
+  audioInline?: { mimeType: string; data: string };
   caption?: string;
 }): Promise<GeminiStoryResult> {
   const config = getGeminiConfig();
@@ -225,19 +186,14 @@ export async function analyzeWithGemini(input: {
     ...input.sceneCuts.map((cut) => cut.timestamp),
     input.video.duration,
   ];
-  const selected = pickGeminiFrames(input.frameFiles, config.maxFrames, extraTimes);
-  const imageParts = await Promise.all(
-    selected.map(async (frame) => {
-      const bytes = await readFile(frame.path);
-      return {
-        text: `Frame at ${frame.timestamp.toFixed(2)}s (JPEG sent to you).`,
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: bytes.toString("base64"),
-        },
-      };
-    }),
-  );
+  const selected = pickGeminiFrames(input.frameImages, config.maxFrames, extraTimes);
+  const imageParts = selected.map((frame) => ({
+    text: `Frame at ${frame.timestamp.toFixed(2)}s (JPEG sent to you).`,
+    inlineData: {
+      mimeType: frame.mimeType || "image/jpeg",
+      data: stripDataUrl(frame.data),
+    },
+  }));
 
   const parts: Array<Record<string, unknown>> = [
     {
@@ -287,20 +243,17 @@ export async function analyzeWithGemini(input: {
     parts.push({ inlineData: part.inlineData });
   }
 
-  if (input.audioPath) {
-    const info = await stat(input.audioPath);
-    if (info.size <= 8 * 1024 * 1024) {
-      const bytes = await readFile(input.audioPath);
-      parts.push({
-        text: "Compressed mono audio from the Short. Transcribe speech into transcript.text. If speech is missing or unintelligible, say so in missingEvidence and do not invent lines.",
-      });
-      parts.push({
-        inlineData: {
-          mimeType: "audio/mpeg",
-          data: bytes.toString("base64"),
-        },
-      });
-    }
+  if (input.audioInline?.data) {
+    const mimeType = input.audioInline.mimeType || "audio/wav";
+    parts.push({
+      text: "Complete audio from the Short (full duration, not a snippet). Transcribe speech into transcript.text. If speech is missing or unintelligible, say so in missingEvidence and do not invent lines.",
+    });
+    parts.push({
+      inlineData: {
+        mimeType,
+        data: stripDataUrl(input.audioInline.data),
+      },
+    });
   }
 
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`;

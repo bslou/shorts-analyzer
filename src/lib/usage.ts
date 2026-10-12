@@ -26,7 +26,9 @@ export function emptyUsage(): UsageReport {
 }
 
 export async function logUsage(report: UsageReport) {
-  const dir = path.join(process.cwd(), ".cache");
+  const dir = process.env.VERCEL
+    ? path.join("/tmp", "shorts-analyzer-cache")
+    : path.join(process.cwd(), ".cache");
   await mkdir(dir, { recursive: true });
   const line = JSON.stringify({ at: new Date().toISOString(), ...report });
   await appendFile(path.join(dir, "usage.jsonl"), `${line}\n`);

@@ -3,8 +3,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { FrameDetections } from "./types";
 
+function cacheRoot() {
+  if (process.env.VERCEL) return path.join("/tmp", "shorts-analyzer-cache");
+  return path.join(process.cwd(), ".cache");
+}
+
 function cacheDir() {
-  return path.join(process.cwd(), ".cache", "roboflow");
+  return path.join(cacheRoot(), "roboflow");
 }
 
 export function cacheKey(parts: {
@@ -45,7 +50,14 @@ export async function writeInferenceCache(key: string, frames: FrameDetections[]
 }
 
 function geminiCacheDir() {
-  return path.join(process.cwd(), ".cache", "gemini");
+  return path.join(cacheRoot(), "gemini");
+}
+
+export function jpegCacheKey(imageBase64: string, modelId: string) {
+  const hash = createHash("sha256");
+  hash.update(modelId);
+  hash.update(imageBase64);
+  return hash.digest("hex");
 }
 
 export function geminiCacheKey(parts: {
