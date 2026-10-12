@@ -86,7 +86,7 @@ export function HomePage() {
       setFile(next);
       setPreview({ ...meta, url });
       URL.revokeObjectURL(meta.url);
-      setCached(Boolean(getCachedAnalysis(fingerprint)));
+      setCached(Boolean(await getCachedAnalysis(fingerprint)));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Invalid video.");
     }
@@ -115,7 +115,7 @@ export function HomePage() {
   async function analyze() {
     if (!file || !preview) return;
     if (cached && !force) {
-      const previous = getCachedAnalysis(fileFingerprint(file));
+      const previous = await getCachedAnalysis(fileFingerprint(file));
       if (previous) {
         const url = await rememberSessionVideo(file, fileFingerprint(file));
         storeAnalysis(previous, url, fileFingerprint(file));

@@ -1,14 +1,21 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { loadVideoBlob, persistVideoBlob } from "./session-video";
+import {
+  loadAnalysisRecord,
+  loadVideoBlob,
+  persistAnalysisRecord,
+  persistVideoBlob,
+  removeOversizedFingerprintCache,
+  safeStorageSet,
+} from "./session-idb";
 import type { AnalysisResult } from "./types";
 
-const RESULT_KEY = "shorts-analyzer-result";
 const FINGERPRINT_KEY = "shorts-analyzer-fingerprint";
-const CACHE_KEY = "shorts-analyzer-by-fingerprint";
 
 let videoObjectUrl: string | null = null;
+let currentResult: AnalysisResult | null = null;
+const memoryByFingerprint = new Map<string, AnalysisResult>();
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -35,42 +42,35 @@ export async function rememberSessionVideo(file: File, fingerprint: string) {
 }
 
 export function storeAnalysis(result: AnalysisResult, videoUrl: string, fingerprint?: string) {
+  currentResult = result;
+  if (fingerprint) memoryByFingerprint.set(fingerprint, result);
   if (videoUrl) replaceObjectUrl(videoUrl);
-  sessionStorage.setItem(RESULT_KEY, JSON.stringify(result));
-  if (fingerprint) {
-    sessionStorage.setItem(FINGERPRINT_KEY, fingerprint);
-    const cache = readFingerprintCache();
-    cache[fingerprint] = result;
-    try {
-      sessionStorage.setItem(CACHE_KEY, JSON.stringify(cache));
-    } catch {
-      sessionStorage.setItem(CACHE_KEY, JSON.stringify({ [fingerprint]: result }));
+  try {
+    removeOversizedFingerprintCache();
+    if (fingerprint && typeof sessionStorage !== "undefined") {
+      safeStorageSet(sessionStorage, FINGERPRINT_KEY, fingerprint);
     }
+  } catch {
+    /* QuotaExceededError must never fail a completed analysis */
   }
+  void persistAnalysisRecord(result, fingerprint || "current").catch(() => undefined);
   emit();
 }
 
-function readFingerprintCache(): Record<string, AnalysisResult> {
+export async function getCachedAnalysis(fingerprint: string): Promise<AnalysisResult | null> {
+  const memory = memoryByFingerprint.get(fingerprint);
+  if (memory) return memory;
   try {
-    const raw = sessionStorage.getItem(CACHE_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, AnalysisResult>) : {};
-  } catch {
-    return {};
-  }
-}
-
-export function getCachedAnalysis(fingerprint: string): AnalysisResult | null {
-  return readFingerprintCache()[fingerprint] ?? null;
-}
-
-function readResult(): AnalysisResult | null {
-  if (typeof sessionStorage === "undefined") return null;
-  try {
-    const raw = sessionStorage.getItem(RESULT_KEY);
-    return raw ? (JSON.parse(raw) as AnalysisResult) : null;
+    const stored = await loadAnalysisRecord(fingerprint);
+    if (stored?.result) {
+      const result = stored.result as AnalysisResult;
+      memoryByFingerprint.set(fingerprint, result);
+      return result;
+    }
   } catch {
     return null;
   }
+  return null;
 }
 
 export function useStoredAnalysis(): {
@@ -90,36 +90,54 @@ export function useStoredAnalysis(): {
 
   useEffect(() => {
     let cancelled = false;
+    removeOversizedFingerprintCache();
 
-    async function hydrateVideo() {
-      if (videoObjectUrl) return videoObjectUrl;
-      try {
-        const stored = await loadVideoBlob();
-        if (!stored || cancelled) return null;
-        const file = new File([stored.blob], stored.name, { type: stored.type || "video/mp4" });
-        const url = URL.createObjectURL(file);
-        replaceObjectUrl(url);
-        return url;
-      } catch {
-        return null;
+    async function hydrate() {
+      if (!currentResult) {
+        const fingerprint =
+          typeof sessionStorage !== "undefined" ? sessionStorage.getItem(FINGERPRINT_KEY) : null;
+        try {
+          const stored = await loadAnalysisRecord(fingerprint || undefined);
+          if (stored?.result && !cancelled) {
+            currentResult = stored.result as AnalysisResult;
+            if (stored.fingerprint) memoryByFingerprint.set(stored.fingerprint, currentResult);
+          }
+        } catch {
+          /* keep memory result */
+        }
+      }
+
+      if (!videoObjectUrl) {
+        try {
+          const stored = await loadVideoBlob();
+          if (stored && !cancelled) {
+            const file = new File([stored.blob], stored.name, { type: stored.type || "video/mp4" });
+            replaceObjectUrl(URL.createObjectURL(file));
+          }
+        } catch {
+          /* player can still use poster frames */
+        }
+      }
+
+      if (!cancelled) {
+        setState({
+          result: currentResult,
+          videoUrl: videoObjectUrl,
+          ready: true,
+        });
       }
     }
 
     const update = () => {
       setState({
-        result: readResult(),
+        result: currentResult,
         videoUrl: videoObjectUrl,
         ready: true,
       });
     };
 
     listeners.add(update);
-    void hydrateVideo().then((url) => {
-      if (cancelled) return;
-      if (url) replaceObjectUrl(url);
-      update();
-    });
-
+    void hydrate();
     return () => {
       cancelled = true;
       listeners.delete(update);
