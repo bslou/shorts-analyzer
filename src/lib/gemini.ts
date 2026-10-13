@@ -2,69 +2,164 @@ import { getGeminiConfig } from "./config";
 import { stripDataUrl } from "./payload";
 import { pickGeminiFrames } from "./pick-frames";
 import { QuotaError } from "./roboflow";
-import type {
-  AudioInsights,
-  FrameDetections,
-  IdeaAnalysis,
-  NarrativeSummary,
-  SceneCut,
-  SectionAnalysis,
-  TimestampedNote,
-  Transcript,
-  VideoMetadata,
-  VisualStats,
-} from "./types";
+import {
+  FORMAT_EXAMPLES,
+  GeminiAnalysisError,
+  buildGeminiStory,
+  type ParsedGeminiStory,
+} from "./video-format";
+import type { AudioInsights, FrameDetections, SceneCut, VideoMetadata, VisualStats } from "./types";
 
-export const VIDEO_FORMATS = [
-  "reaction",
-  "cooking",
-  "comedy",
-  "storytelling",
-  "commentary",
-  "educational",
-  "vlog",
-  "other",
-] as const;
+export { GeminiAnalysisError };
 
-export type VideoFormatLabel = (typeof VIDEO_FORMATS)[number];
-
-export type GeminiStoryResult = {
-  format: {
-    label: VideoFormatLabel;
-    secondary: string[];
-    explanation: string;
-    embeddedContent?: string;
-  };
-  narrative: NarrativeSummary;
-  transcript: Transcript | null;
-  idea: IdeaAnalysis;
-  hook: SectionAnalysis;
-  pacing: SectionAnalysis;
-  storytelling: SectionAnalysis;
-  outcome: SectionAnalysis;
-  visuals: SectionAnalysis;
-  caption: SectionAnalysis | null;
-  strengths: TimestampedNote[];
-  weaknesses: TimestampedNote[];
-  recommendations: TimestampedNote[];
-  alternativeHook: { text: string; why: string } | null;
-  missingEvidence: string[];
+export type GeminiStoryResult = ParsedGeminiStory & {
   usage: {
     inputTokens: number;
     outputTokens: number;
   };
 };
 
+type GeminiPart = {
+  text?: string;
+  thought?: boolean;
+  inlineData?: unknown;
+};
+
 type GeminiResponse = {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
+    content?: { parts?: GeminiPart[]; role?: string };
     finishReason?: string;
   }>;
   usageMetadata?: {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
+    totalTokenCount?: number;
+    thoughtsTokenCount?: number;
   };
   error?: { message?: string; status?: string; code?: number };
+};
+
+const NOTE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    timestamp: { type: "NUMBER", description: "Seconds from start when this is observable." },
+    endTimestamp: { type: "NUMBER" },
+    text: { type: "STRING" },
+    why: { type: "STRING" },
+    source: { type: "STRING", description: "roboflow, gemini, audio, transcript, or ffmpeg" },
+    kind: { type: "STRING", description: "observed or opinion" },
+  },
+  required: ["text"],
+};
+
+const SECTION_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    score: { type: "NUMBER", nullable: true, description: "Editorial 1-10, or null when uncertain." },
+    uncertain: { type: "BOOLEAN" },
+    explanation: { type: "STRING" },
+    recommendations: { type: "ARRAY", items: NOTE_SCHEMA },
+  },
+  required: ["score", "uncertain", "explanation", "recommendations"],
+};
+
+const IDEA_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    score: { type: "NUMBER", nullable: true },
+    uncertain: { type: "BOOLEAN" },
+    premise: { type: "STRING" },
+    explanation: { type: "STRING" },
+    recommendations: { type: "ARRAY", items: NOTE_SCHEMA },
+  },
+  required: ["score", "uncertain", "premise", "explanation", "recommendations"],
+};
+
+/** OpenAPI-style schema for Gemini responseSchema. Format labels stay open strings. */
+export const GEMINI_ANALYSIS_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    format: {
+      type: "OBJECT",
+      properties: {
+        label: {
+          type: "STRING",
+          description:
+            "Open-ended snake_case format inferred from this video. Not limited to a fixed list. Use other only when the format cannot be determined.",
+        },
+        secondary: { type: "ARRAY", items: { type: "STRING" } },
+        explanation: { type: "STRING" },
+        embeddedContent: { type: "STRING" },
+      },
+      required: ["label", "secondary", "explanation"],
+    },
+    narrative: {
+      type: "OBJECT",
+      properties: {
+        premise: { type: "STRING" },
+        opening: { type: "STRING" },
+        retention: { type: "STRING" },
+        ending: { type: "STRING" },
+        originalVsReaction: { type: "STRING" },
+      },
+      required: ["premise", "opening", "retention", "ending"],
+    },
+    transcript: {
+      type: "OBJECT",
+      nullable: true,
+      properties: {
+        text: { type: "STRING" },
+        language: { type: "STRING" },
+        segments: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              start: { type: "NUMBER" },
+              end: { type: "NUMBER" },
+              text: { type: "STRING" },
+            },
+            required: ["start", "end", "text"],
+          },
+        },
+      },
+      required: ["text", "segments"],
+    },
+    idea: IDEA_SCHEMA,
+    hook: SECTION_SCHEMA,
+    pacing: SECTION_SCHEMA,
+    storytelling: SECTION_SCHEMA,
+    outcome: SECTION_SCHEMA,
+    visuals: SECTION_SCHEMA,
+    caption: { ...SECTION_SCHEMA, nullable: true },
+    strengths: { type: "ARRAY", items: NOTE_SCHEMA },
+    weaknesses: { type: "ARRAY", items: NOTE_SCHEMA },
+    recommendations: { type: "ARRAY", items: NOTE_SCHEMA },
+    alternativeHook: {
+      type: "OBJECT",
+      nullable: true,
+      properties: {
+        text: { type: "STRING" },
+        why: { type: "STRING" },
+      },
+      required: ["text", "why"],
+    },
+    missingEvidence: { type: "ARRAY", items: { type: "STRING" } },
+  },
+  required: [
+    "format",
+    "narrative",
+    "idea",
+    "hook",
+    "pacing",
+    "storytelling",
+    "outcome",
+    "visuals",
+    "strengths",
+    "weaknesses",
+    "recommendations",
+    "missingEvidence",
+  ],
 };
 
 function compactDetections(frames: FrameDetections[]) {
@@ -81,63 +176,14 @@ function compactDetections(frames: FrameDetections[]) {
   }));
 }
 
-function asNotes(value: unknown): TimestampedNote[] {
-  if (!Array.isArray(value)) return [];
-  const notes: TimestampedNote[] = [];
-  for (const item of value) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const text = typeof record.text === "string" ? record.text.trim() : "";
-    if (!text) continue;
-    const note: TimestampedNote = { text };
-    if (typeof record.timestamp === "number") note.timestamp = record.timestamp;
-    if (typeof record.endTimestamp === "number") note.endTimestamp = record.endTimestamp;
-    if (typeof record.why === "string" && record.why.trim()) note.why = record.why.trim();
-    if (
-      record.source === "roboflow" ||
-      record.source === "gemini" ||
-      record.source === "audio" ||
-      record.source === "transcript" ||
-      record.source === "ffmpeg"
-    ) {
-      note.source = record.source;
-    }
-    if (record.kind === "observed" || record.kind === "opinion") note.kind = record.kind;
-    notes.push(note);
-  }
-  return notes;
-}
-
-function parseScore(value: unknown): { score: number | null; uncertain: boolean } {
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    if (record.uncertain === true || record.score === null) {
-      return { score: null, uncertain: true };
-    }
-    if (typeof record.score === "number" && Number.isFinite(record.score)) {
-      return { score: Math.max(1, Math.min(10, record.score)), uncertain: false };
-    }
-  }
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return { score: Math.max(1, Math.min(10, value)), uncertain: false };
-  }
-  return { score: null, uncertain: true };
-}
-
-function normalizeSection(value: unknown, fallback: string): SectionAnalysis {
-  const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
-  const { score, uncertain } = parseScore(record);
-  return {
-    score,
-    uncertain: uncertain || !String(record.explanation || "").trim(),
-    explanation: typeof record.explanation === "string" && record.explanation.trim() ? record.explanation.trim() : fallback,
-    recommendations: asNotes(record.recommendations),
-  };
+function logGeminiDebug(info: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  console.info("[gemini]", info);
 }
 
 const SYSTEM_PROMPT = `You are a YouTube Shorts editor reviewing one video.
 Combine Roboflow object detections, sampled frames, audio/transcript, and measured visual changes.
-Return JSON only.
+Return JSON that matches the provided response schema.
 
 Accuracy:
 - Never invent dialogue, timestamps, objects, or performance statistics.
@@ -148,15 +194,17 @@ Accuracy:
 - If evidence is thin for a category, set uncertain=true and score=null instead of guessing.
 
 Format:
-- Choose a primary format and optional secondary formats from: reaction, cooking, comedy, storytelling, commentary, educational, vlog, other.
-- Do not call a reaction video a cooking tutorial just because food appears inside embedded footage.
-- If someone is reacting to another creator's clip, say so in embeddedContent and originalVsReaction.
+- Assign a primary snake_case format label from this video's visuals, audio/transcript, and structure.
+- Examples (not exhaustive): ${FORMAT_EXAMPLES.join(", ")}.
+- If none of the examples fit, invent a concise snake_case label that describes the format.
+- Use "other" only when the format genuinely cannot be determined from the evidence you received.
+- Do not default to reaction, cooking, or other because those words appear in examples.
+- If nested or reacted-to footage is present, describe it in embeddedContent.
 
-Evaluation must match the format:
-- Reaction: context setup, commentary quality, humor, whether the reaction payoff lands.
-- Cooking: clarity of the process, visual appetizing quality, whether the result is shown.
-- Comedy: setup/punchline timing, not tutorial structure.
-- Educational/commentary: claim, evidence, takeaway.
+Evaluation:
+- Score idea, hook, pacing, storytelling, payoff (outcome), and visuals using criteria that fit the detected format.
+- Infer those criteria from the format (for example a street interview on questions, responses, pacing, and payoff; a reaction on commentary quality and reaction payoff).
+- Do not force an unrelated structure onto the video.
 
 Scores are editorial 1-10, not forecasts.
 Provide exactly three strengths, three weaknesses, and three editing recommendations when evidence allows; fewer is fine if evidence is thin.
@@ -206,34 +254,6 @@ export async function analyzeWithGemini(input: {
         visualStatsFromRoboflow: input.stats,
         roboflowDetections: compactDetections(input.frames),
         geminiFrameTimestamps: selected.map((frame) => frame.timestamp),
-        jsonShape: {
-          format: {
-            label: "reaction",
-            secondary: ["commentary"],
-            explanation: "why this format",
-            embeddedContent: "optional description of nested footage",
-          },
-          narrative: {
-            premise: "",
-            opening: "",
-            retention: "",
-            ending: "",
-            originalVsReaction: "",
-          },
-          transcript: { text: "", language: "en", segments: [{ start: 0, end: 1, text: "" }] },
-          idea: { score: 7, uncertain: false, premise: "", explanation: "", recommendations: [] },
-          hook: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          pacing: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          storytelling: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          outcome: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          visuals: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          caption: { score: 7, uncertain: false, explanation: "", recommendations: [] },
-          strengths: [{ timestamp: 0, text: "", why: "", source: "gemini", kind: "opinion" }],
-          weaknesses: [{ timestamp: 0, text: "", why: "", source: "gemini", kind: "opinion" }],
-          recommendations: [{ timestamp: 0, text: "", why: "", source: "gemini", kind: "opinion" }],
-          alternativeHook: { text: "", why: "" },
-          missingEvidence: ["if audio failed, say so"],
-        },
       }),
     },
   ];
@@ -263,6 +283,7 @@ export async function analyzeWithGemini(input: {
       temperature: 0.25,
       maxOutputTokens: config.maxOutputTokens,
       responseMimeType: "application/json",
+      responseSchema: GEMINI_ANALYSIS_SCHEMA,
     },
   });
   const models = config.model.endsWith("-preview")
@@ -307,99 +328,55 @@ export async function analyzeWithGemini(input: {
     throw new Error(payload.error?.message || `Gemini request failed with HTTP ${response.status}.`);
   }
 
-  const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
-  if (!text) {
-    throw new Error(
-      `Gemini returned an empty analysis (${payload.candidates?.[0]?.finishReason || "no finish reason"}).`,
+  const candidate = payload.candidates?.[0];
+  const finishReason = candidate?.finishReason || "unknown";
+  const partSummaries = (candidate?.content?.parts || []).map((part) => {
+    if (part.thought) return "thought";
+    if (typeof part.text === "string") return `text:${part.text.length}`;
+    return Object.keys(part).join(",") || "empty-part";
+  });
+  const text = (candidate?.content?.parts || []).map((part) => (part.thought ? "" : part.text || "")).join("");
+  logGeminiDebug({
+    finishReason,
+    promptTokenCount: payload.usageMetadata?.promptTokenCount ?? null,
+    candidatesTokenCount: payload.usageMetadata?.candidatesTokenCount ?? null,
+    thoughtsTokenCount: payload.usageMetadata?.thoughtsTokenCount ?? null,
+    totalTokenCount: payload.usageMetadata?.totalTokenCount ?? null,
+    candidateCount: payload.candidates?.length ?? 0,
+    partKinds: partSummaries,
+    textChars: text.length,
+    maxOutputTokens: config.maxOutputTokens,
+  });
+
+  if (finishReason === "MAX_TOKENS" && !text.trim()) {
+    throw new GeminiAnalysisError(
+      `Gemini hit the output token limit (${config.maxOutputTokens}) before returning JSON. Increase GEMINI_MAX_OUTPUT_TOKENS.`,
+      finishReason,
+    );
+  }
+  if (!text.trim()) {
+    throw new GeminiAnalysisError(`Gemini returned an empty analysis (${finishReason}).`, finishReason);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    throw new GeminiAnalysisError(
+      finishReason === "MAX_TOKENS"
+        ? `Gemini output was truncated at ${config.maxOutputTokens} tokens (finishReason MAX_TOKENS) and was not valid JSON.`
+        : `Gemini returned invalid JSON (finishReason ${finishReason}).`,
+      finishReason,
     );
   }
 
-  const parsed = JSON.parse(text) as Record<string, unknown>;
-  const formatRecord = parsed.format && typeof parsed.format === "object" ? (parsed.format as Record<string, unknown>) : {};
-  const formatLabel = VIDEO_FORMATS.includes(
-    String(formatRecord.label || "").toLowerCase().trim() as VideoFormatLabel,
-  )
-    ? (String(formatRecord.label || "").toLowerCase().trim() as VideoFormatLabel)
-    : "other";
-  const secondary = Array.isArray(formatRecord.secondary)
-    ? formatRecord.secondary.filter((item): item is string => typeof item === "string")
-    : [];
-  const narrativeRecord =
-    parsed.narrative && typeof parsed.narrative === "object" ? (parsed.narrative as Record<string, unknown>) : {};
-  const ideaRecord = parsed.idea && typeof parsed.idea === "object" ? (parsed.idea as Record<string, unknown>) : {};
-  const transcriptRecord =
-    parsed.transcript && typeof parsed.transcript === "object" ? (parsed.transcript as Record<string, unknown>) : null;
+  if (finishReason === "MAX_TOKENS") {
+    logGeminiDebug({ finishReason, truncated: true, parsedKeys: Object.keys(parsed) });
+  }
 
+  const story = buildGeminiStory(parsed, input.caption);
   return {
-    format: {
-      label: formatLabel,
-      secondary,
-      explanation:
-        typeof formatRecord.explanation === "string" && formatRecord.explanation.trim()
-          ? formatRecord.explanation.trim()
-          : "Format was not clearly stated.",
-      embeddedContent:
-        typeof formatRecord.embeddedContent === "string" ? formatRecord.embeddedContent.trim() : undefined,
-    },
-    narrative: {
-      premise: String(narrativeRecord.premise || ideaRecord.premise || "").trim() || "The model did not state a premise.",
-      opening: String(narrativeRecord.opening || "").trim() || "Opening was not described.",
-      retention: String(narrativeRecord.retention || "").trim() || "What keeps viewers watching was not described.",
-      ending: String(narrativeRecord.ending || "").trim() || "Ending was not described.",
-      originalVsReaction:
-        typeof narrativeRecord.originalVsReaction === "string"
-          ? narrativeRecord.originalVsReaction.trim()
-          : undefined,
-    },
-    transcript:
-      transcriptRecord && typeof transcriptRecord.text === "string" && transcriptRecord.text.trim()
-        ? {
-            text: transcriptRecord.text.trim(),
-            language: typeof transcriptRecord.language === "string" ? transcriptRecord.language : undefined,
-            segments: Array.isArray(transcriptRecord.segments)
-              ? transcriptRecord.segments.flatMap((item) => {
-                  if (!item || typeof item !== "object") return [];
-                  const record = item as Record<string, unknown>;
-                  if (typeof record.text !== "string") return [];
-                  return [
-                    {
-                      start: typeof record.start === "number" ? record.start : 0,
-                      end: typeof record.end === "number" ? record.end : 0,
-                      text: record.text,
-                    },
-                  ];
-                })
-              : [],
-          }
-        : null,
-    idea: {
-      ...normalizeSection(parsed.idea, "No idea analysis was returned."),
-      premise: String(ideaRecord.premise || narrativeRecord.premise || "").trim() || "The model did not state a premise.",
-    },
-    hook: normalizeSection(parsed.hook, "No hook analysis was returned."),
-    pacing: normalizeSection(parsed.pacing, "No pacing analysis was returned."),
-    storytelling: normalizeSection(parsed.storytelling, "No storytelling analysis was returned."),
-    outcome: normalizeSection(parsed.outcome, "No payoff analysis was returned."),
-    visuals: normalizeSection(parsed.visuals, "No visual analysis was returned."),
-    caption: input.caption
-      ? normalizeSection(parsed.caption, "Caption was provided but not analyzed.")
-      : null,
-    strengths: asNotes(parsed.strengths).slice(0, 3),
-    weaknesses: asNotes(parsed.weaknesses).slice(0, 3),
-    recommendations: asNotes(parsed.recommendations).slice(0, 3),
-    alternativeHook:
-      parsed.alternativeHook &&
-      typeof parsed.alternativeHook === "object" &&
-      typeof (parsed.alternativeHook as Record<string, unknown>).text === "string" &&
-      String((parsed.alternativeHook as Record<string, unknown>).text).trim()
-        ? {
-            text: String((parsed.alternativeHook as Record<string, unknown>).text).trim(),
-            why: String((parsed.alternativeHook as Record<string, unknown>).why || "").trim(),
-          }
-        : null,
-    missingEvidence: Array.isArray(parsed.missingEvidence)
-      ? parsed.missingEvidence.filter((item): item is string => typeof item === "string")
-      : [],
+    ...story,
     usage: {
       inputTokens: payload.usageMetadata?.promptTokenCount ?? 0,
       outputTokens: payload.usageMetadata?.candidatesTokenCount ?? 0,

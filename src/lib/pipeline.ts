@@ -21,6 +21,7 @@ import {
 import { inferFrames } from "./roboflow";
 import { planSampleTimestamps } from "./sample-plan";
 import { analyzeStory } from "./story-analysis";
+import { isReusableGeminiCache } from "./video-format";
 import { cleanupJobDir, createJobDir } from "./temp";
 import type { AnalysisResult, FrameDetections, ProgressEvent } from "./types";
 import { emptyUsage, logUsage } from "./usage";
@@ -242,6 +243,9 @@ export async function* runAnalysis(
       detectionDigest: detectionDigest(detections),
     });
     let story = options.force ? null : await readGeminiCache<StoryCache>(editorialKey);
+    if (story && !isReusableGeminiCache(story)) {
+      story = null;
+    }
     if (story) {
       usage.notes.push("Gemini editorial review loaded from local cache; no new Gemini call.");
       yield { type: "stage", stage: "analyzing_story", message: "Using cached Gemini editorial review" };
@@ -296,7 +300,7 @@ export async function* runAnalysis(
         caption,
         warnings,
       });
-      if (story.geminiUsage.requests > 0) {
+      if (story.geminiUsage.requests > 0 && isReusableGeminiCache(story)) {
         await writeGeminiCache(editorialKey, story);
       }
     }

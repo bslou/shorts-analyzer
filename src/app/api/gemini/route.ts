@@ -6,6 +6,7 @@ import { MAX_VERCEL_JSON_BYTES } from "@/lib/constants";
 import { assertUnderVercelLimit } from "@/lib/payload";
 import { QuotaError } from "@/lib/roboflow";
 import { analyzeStory } from "@/lib/story-analysis";
+import { isReusableGeminiCache } from "@/lib/video-format";
 import type { AnalysisResult, AudioInsights, FrameDetections, SceneCut, VideoMetadata } from "@/lib/types";
 import { emptyUsage, logUsage } from "@/lib/usage";
 import { computeVisualStats } from "@/lib/visual-stats";
@@ -107,6 +108,9 @@ export async function POST(request: Request) {
     });
 
     let story = body.force ? null : await readGeminiCache<StoryCache>(editorialKey);
+    if (story && !isReusableGeminiCache(story)) {
+      story = null;
+    }
     const usedGeminiCache = Boolean(story);
     if (story) {
       usage.notes.push("Gemini editorial review loaded from local cache; no new Gemini call.");
@@ -157,7 +161,7 @@ export async function POST(request: Request) {
         caption: body.caption,
         warnings,
       });
-      if (story.geminiUsage.requests > 0) {
+      if (story.geminiUsage.requests > 0 && isReusableGeminiCache(story)) {
         await writeGeminiCache(editorialKey, story);
       }
     }

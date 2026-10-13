@@ -1,6 +1,6 @@
 import { clampScore } from "./format";
 import { analyzeWithGemini, type GeminiStoryResult } from "./gemini";
-import { QuotaError } from "./roboflow";
+import { displayFormatLabel } from "./video-format";
 import type {
   AnalysisResult,
   AudioInsights,
@@ -88,9 +88,9 @@ function visualOnlyAnalysis(
   };
   return {
     format: {
-      label: "other",
+      label: "unclassified",
       secondary: [],
-      explanation: "Format classification requires Gemini.",
+      explanation: "Format was not classified because Gemini editorial analysis did not complete. This is not an other-format judgment.",
     },
     narrative: {
       premise: idea.premise,
@@ -171,7 +171,7 @@ function finalize(payload: GeminiStoryResult, missingEvidence: string[]): Editor
       explanation:
         overallScore === null
           ? "Overall score left uncertain because too few categories had enough evidence."
-          : `Weighted editorial average for a ${payload.format.label} Short. Not a forecast of views or retention.`,
+          : `Weighted editorial average for a ${displayFormatLabel(payload.format.label)} Short. Not a forecast of views or retention.`,
       weights,
     },
   };
@@ -215,36 +215,19 @@ export async function analyzeStory(input: {
     };
   }
 
-  try {
-    const payload = await analyzeWithGemini(input);
-    const mergedMissing = [...missing, ...payload.missingEvidence];
-    if (!payload.transcript?.text) {
-      mergedMissing.push("No transcript was produced. Spoken lines were not treated as facts.");
-    }
-    return {
-      editorial: finalize(payload, [...new Set(mergedMissing)]),
-      transcript: payload.transcript,
-      narrative: payload.narrative,
-      geminiUsage: {
-        inputTokens: payload.usage.inputTokens,
-        outputTokens: payload.usage.outputTokens,
-        requests: 1,
-      },
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Gemini analysis failed.";
-    if (error instanceof QuotaError) {
-      input.warnings.push(message);
-    } else {
-      input.warnings.push(`Gemini editorial analysis failed: ${message}`);
-    }
-    missing.push("Gemini editorial analysis did not complete.");
-    const fallback = visualOnlyAnalysis(input.stats, input.frames, input.sceneCuts, input.caption, missing);
-    return {
-      editorial: finalize(fallback, missing),
-      transcript: null,
-      narrative: fallback.narrative,
-      geminiUsage: { inputTokens: 0, outputTokens: 0, requests: 0 },
-    };
+  const payload = await analyzeWithGemini(input);
+  const mergedMissing = [...missing, ...payload.missingEvidence];
+  if (!payload.transcript?.text) {
+    mergedMissing.push("No transcript was produced. Spoken lines were not treated as facts.");
   }
+  return {
+    editorial: finalize(payload, [...new Set(mergedMissing)]),
+    transcript: payload.transcript,
+    narrative: payload.narrative,
+    geminiUsage: {
+      inputTokens: payload.usage.inputTokens,
+      outputTokens: payload.usage.outputTokens,
+      requests: 1,
+    },
+  };
 }

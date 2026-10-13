@@ -74,7 +74,7 @@ export function getGeminiConfig() {
     apiKey,
     model,
     maxFrames: Math.round(numberEnv("GEMINI_MAX_FRAMES", 12)),
-    maxOutputTokens: Math.round(numberEnv("GEMINI_MAX_OUTPUT_TOKENS", 4096)),
+    maxOutputTokens: Math.max(8192, Math.round(numberEnv("GEMINI_MAX_OUTPUT_TOKENS", 16384))),
     inputUsdPerMillion: numberEnv("GEMINI_INPUT_USD_PER_MILLION", 0.15),
     outputUsdPerMillion: numberEnv("GEMINI_OUTPUT_USD_PER_MILLION", 0.6),
   };

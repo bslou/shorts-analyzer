@@ -5,6 +5,7 @@ import { detectionsInWindow, nearestFrame } from "@/lib/roboflow-evidence";
 import { SCORE_CATEGORIES, scoreBreakdown, sectionFor } from "@/lib/score-math";
 import type { AnalysisResult, TimestampedNote } from "@/lib/types";
 import { formatTimestamp } from "@/lib/format";
+import { displayFormatLabel } from "@/lib/video-format";
 import { DetectionTimeline } from "./DetectionTimeline";
 import { RoboflowEvidence, SourceBadge } from "./RoboflowEvidence";
 import { ScoreRing } from "./ScoreRing";
@@ -139,9 +140,13 @@ export function AnalysisDashboard({
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0 max-w-2xl">
               <p className="text-[11px] uppercase tracking-[0.16em] text-muted">Detected format</p>
-              <h1 className="mt-2 text-2xl font-semibold capitalize">{result.format.label}</h1>
+              <h1 className="mt-2 text-2xl font-semibold capitalize">
+                {displayFormatLabel(result.format.label)}
+              </h1>
               {result.format.secondary.length > 0 ? (
-                <p className="mt-1 text-sm text-muted">Also: {result.format.secondary.join(", ")}</p>
+                <p className="mt-1 text-sm text-muted">
+                  Also: {result.format.secondary.map((item) => displayFormatLabel(item)).join(", ")}
+                </p>
               ) : null}
               <p className="mt-3 text-sm leading-6 text-zinc-300">{result.format.explanation}</p>
               {result.format.embeddedContent ? (
@@ -182,7 +187,7 @@ export function AnalysisDashboard({
             </table>
           </div>
           <p className="mt-3 text-xs leading-5 text-muted">
-            Overall is a weighted average of scored categories for a {result.format.label} Short
+            Overall is a weighted average of scored categories for a {displayFormatLabel(result.format.label)} Short
             {breakdown.overall !== null ? ` (${breakdown.overall.toFixed(1)})` : ""}. Uncertain
             categories are omitted. This is editorial judgment, not a prediction of views, retention,
             or virality.
