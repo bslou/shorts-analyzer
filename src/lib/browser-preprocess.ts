@@ -17,34 +17,58 @@ function even(value: number) {
   return Math.max(2, Math.round(value / 2) * 2);
 }
 
-function seekVideo(video: HTMLVideoElement, timestamp: number) {
-  return new Promise<void>((resolve, reject) => {
-    const target = Math.min(Math.max(timestamp, 0), Math.max(video.duration - 0.04, 0));
-    if (Math.abs(video.currentTime - target) < 0.02) {
+function waitForVideoFrame(video: HTMLVideoElement) {
+  return new Promise<void>((resolve) => {
+    const timer = window.setTimeout(() => resolve(), 90);
+    const done = () => {
+      window.clearTimeout(timer);
       resolve();
+    };
+    const rvfc = (
+      video as HTMLVideoElement & {
+        requestVideoFrameCallback?: (cb: () => void) => number;
+      }
+    ).requestVideoFrameCallback;
+    if (typeof rvfc === "function") {
+      rvfc.call(video, () => done());
       return;
     }
-    const onSeeked = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = () => {
-      cleanup();
-      reject(new Error(`Could not seek to ${timestamp.toFixed(2)}s.`));
-    };
-    const timer = window.setTimeout(() => {
-      cleanup();
-      resolve();
-    }, 2500);
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      video.removeEventListener("seeked", onSeeked);
-      video.removeEventListener("error", onError);
-    };
-    video.addEventListener("seeked", onSeeked);
-    video.addEventListener("error", onError);
-    video.currentTime = target;
+    requestAnimationFrame(() => done());
   });
+}
+
+async function seekVideo(video: HTMLVideoElement, timestamp: number, quick = false) {
+  const target = Math.min(Math.max(timestamp, 0), Math.max(video.duration - 0.05, 0));
+  const attempts = quick ? 1 : 2;
+  const timeoutMs = quick ? 350 : 700;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        video.removeEventListener("seeked", finish);
+        resolve();
+      };
+      const timer = window.setTimeout(finish, timeoutMs);
+      video.addEventListener("seeked", finish);
+      if (Math.abs(video.currentTime - target) < 0.04 && video.readyState >= 2) {
+        finish();
+        return;
+      }
+      try {
+        video.currentTime = target;
+      } catch {
+        finish();
+      }
+    });
+    await waitForVideoFrame(video);
+    if (Math.abs(video.currentTime - target) <= 0.12 && video.readyState >= 2) return;
+  }
+  if (Math.abs(video.currentTime - target) > 0.2) {
+    throw new Error(`Could not seek to ${timestamp.toFixed(2)}s (at ${video.currentTime.toFixed(2)}s).`);
+  }
 }
 
 function canvasToJpeg(
@@ -91,7 +115,7 @@ export async function detectBrowserSceneCuts(
   video: HTMLVideoElement,
   duration: number,
 ): Promise<SceneCut[]> {
-  const step = Math.max(0.25, duration / 120);
+  const step = 1;
   const cuts: SceneCut[] = [];
   const sampleW = 48;
   const sampleH = 86;
@@ -102,7 +126,11 @@ export async function detectBrowserSceneCuts(
   if (!ctx) return [];
   let previous: Uint8ClampedArray | null = null;
   for (let t = 0; t < duration - 0.05; t += step) {
-    await seekVideo(video, t);
+    try {
+      await seekVideo(video, t, true);
+    } catch {
+      continue;
+    }
     ctx.drawImage(video, 0, 0, sampleW, sampleH);
     const pixels = ctx.getImageData(0, 0, sampleW, sampleH).data;
     if (previous) {
@@ -125,6 +153,7 @@ export async function extractJpegAtTimestamp(
   timestamp: number,
 ): Promise<ExtractedJpeg> {
   await seekVideo(video, timestamp);
+  await waitForVideoFrame(video);
   let quality = 0.85;
   let encoded = await canvasToJpeg(video, JPEG_MAX_WIDTH, quality);
   while (encoded.blob.size > 220_000 && quality > 0.62) {
@@ -362,8 +391,10 @@ export async function preprocessVideo(
     fileName: file.name,
   };
 
+  const hashPromise = hashFile(file);
   onProgress("Measuring visual transitions in the browser");
   const sceneCuts = await detectBrowserSceneCuts(video, duration);
+  onProgress("Planning adaptive JPEG samples");
   const timestamps = planSampleTimestamps({
     duration,
     intervalSeconds: sampling.intervalSeconds,
@@ -383,7 +414,13 @@ export async function preprocessVideo(
       timestamps.length,
     );
     try {
-      frames.push(await extractJpegAtTimestamp(video, timestamps[i]));
+      let jpeg = await extractJpegAtTimestamp(video, timestamps[i]);
+      const prev = frames.at(-1);
+      if (prev && prev.base64 === jpeg.base64 && timestamps[i] - prev.timestamp > 0.2) {
+        jpeg = await extractJpegAtTimestamp(video, Math.min(timestamps[i] + 0.08, duration - 0.05));
+        jpeg = { ...jpeg, timestamp: Number(timestamps[i].toFixed(3)) };
+      }
+      frames.push(jpeg);
     } catch (error) {
       const lastSafe = lastSafeTimestamp(duration, metadata.frameRate);
       if (timestamps[i] >= lastSafe - 0.05) continue;
@@ -397,6 +434,6 @@ export async function preprocessVideo(
   onProgress("Extracting the complete audio track");
   const audio = await extractCompleteAudio(file, duration);
   metadata.hasAudio = audio.hasAudio;
-  const fileHash = await hashFile(file);
+  const fileHash = await hashPromise;
   return { metadata, frames, sceneCuts, audio, fileHash };
 }

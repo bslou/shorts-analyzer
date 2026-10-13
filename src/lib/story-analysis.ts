@@ -95,7 +95,7 @@ function visualOnlyAnalysis(
     narrative: {
       premise: idea.premise,
       opening: `Hook-window Roboflow classes: ${hookClasses.join(", ") || "none"}.`,
-      retention: `${sceneCuts.length} FFmpeg scene cut(s); ${stats.visualChanges.length} Roboflow composition shift(s).`,
+      retention: `${sceneCuts.length} scene cut(s); ${stats.visualChanges.length} Roboflow composition shift(s).`,
       ending: "Ending payoff was not judged without Gemini.",
     },
     transcript: null,

@@ -2,6 +2,7 @@ import { getBudgetConfig, getGeminiConfig, getRoboflowConfig } from "@/lib/confi
 import { estimateAnalysisCost, toBudgetEvent, usdFromTokens } from "@/lib/cost";
 import { detectionDigest } from "@/lib/detection-digest";
 import { geminiCacheKey, readGeminiCache, writeGeminiCache } from "@/lib/inference-cache";
+import { MAX_VERCEL_JSON_BYTES } from "@/lib/constants";
 import { assertUnderVercelLimit } from "@/lib/payload";
 import { QuotaError } from "@/lib/roboflow";
 import { analyzeStory } from "@/lib/story-analysis";
@@ -51,7 +52,7 @@ export async function POST(request: Request) {
       "Gemini request metadata",
     );
     const bytes = new TextEncoder().encode(JSON.stringify(body)).length;
-    if (bytes > 3_200_000) {
+    if (bytes > MAX_VERCEL_JSON_BYTES) {
       return Response.json(
         {
           message: `Gemini request is ${(bytes / 1_000_000).toFixed(2)}MB, over the Vercel Hobby 4.5MB limit.`,
@@ -106,6 +107,7 @@ export async function POST(request: Request) {
     });
 
     let story = body.force ? null : await readGeminiCache<StoryCache>(editorialKey);
+    const usedGeminiCache = Boolean(story);
     if (story) {
       usage.notes.push("Gemini editorial review loaded from local cache; no new Gemini call.");
     } else {
@@ -174,8 +176,10 @@ export async function POST(request: Request) {
         source: "actual-tokens",
         label: "from API token counts",
       };
-    } else {
+    } else if (usedGeminiCache) {
       usage.geminiUsd = { usd: 0, source: "cached", label: "cache hit" };
+    } else {
+      usage.geminiUsd = { usd: 0, source: "cached", label: "skipped" };
     }
     usage.totalUsd = Number((usage.roboflowUsd.usd + usage.geminiUsd.usd).toFixed(6));
     usage.overBudget = usage.totalUsd > budget.softBudgetUsd;

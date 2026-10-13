@@ -256,30 +256,48 @@ export async function analyzeWithGemini(input: {
     });
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": config.apiKey,
+  const body = JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: [{ role: "user", parts }],
+    generationConfig: {
+      temperature: 0.25,
+      maxOutputTokens: config.maxOutputTokens,
+      responseMimeType: "application/json",
     },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature: 0.25,
-        maxOutputTokens: config.maxOutputTokens,
-        responseMimeType: "application/json",
-      },
-    }),
   });
-
-  const payload = (await response.json()) as GeminiResponse;
+  const models = config.model.endsWith("-preview")
+    ? [config.model]
+    : [config.model, `${config.model}-preview`];
+  const urls = models.flatMap((model) => [
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+    `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent`,
+  ]);
+  let payload: GeminiResponse = {};
+  let response: Response | null = null;
+  for (const url of urls) {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": config.apiKey,
+      },
+      body,
+    });
+    payload = (await response.json()) as GeminiResponse;
+    const versionMiss =
+      response.status === 404 ||
+      /not found for API version|is not found for API version|not supported for generateContent/i.test(
+        payload.error?.message || "",
+      );
+    if (!versionMiss || url === urls[urls.length - 1]) break;
+  }
+  if (!response) throw new Error("Gemini request failed.");
   const quota =
     response.status === 429 ||
     response.status === 402 ||
     payload.error?.status === "RESOURCE_EXHAUSTED" ||
-    payload.error?.code === 429;
+    payload.error?.code === 429 ||
+    /high demand|RESOURCE_EXHAUSTED/i.test(payload.error?.message || "");
   if (quota) {
     throw new QuotaError(
       `Gemini quota or rate limit reached. The app will not retry or switch to a more expensive model. ${payload.error?.message || ""}`.trim(),
@@ -298,8 +316,10 @@ export async function analyzeWithGemini(input: {
 
   const parsed = JSON.parse(text) as Record<string, unknown>;
   const formatRecord = parsed.format && typeof parsed.format === "object" ? (parsed.format as Record<string, unknown>) : {};
-  const formatLabel = VIDEO_FORMATS.includes(formatRecord.label as VideoFormatLabel)
-    ? (formatRecord.label as VideoFormatLabel)
+  const formatLabel = VIDEO_FORMATS.includes(
+    String(formatRecord.label || "").toLowerCase().trim() as VideoFormatLabel,
+  )
+    ? (String(formatRecord.label || "").toLowerCase().trim() as VideoFormatLabel)
     : "other";
   const secondary = Array.isArray(formatRecord.secondary)
     ? formatRecord.secondary.filter((item): item is string => typeof item === "string")

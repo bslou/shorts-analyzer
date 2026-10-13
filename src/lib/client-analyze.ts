@@ -87,22 +87,34 @@ function loadVideoElement(url: string) {
     video.preload = "auto";
     video.muted = true;
     video.playsInline = true;
-    video.crossOrigin = "anonymous";
     video.src = url;
-    const onReady = () => {
-      video.removeEventListener("loadeddata", onReady);
-      video.removeEventListener("error", onError);
-      resolve(video);
-    };
     const onError = () => {
-      video.removeEventListener("loadeddata", onReady);
       video.removeEventListener("error", onError);
       reject(new Error("Could not decode the video in the browser for frame extraction."));
     };
-    video.addEventListener("loadeddata", onReady);
     video.addEventListener("error", onError);
-    video.style.cssText = "position:fixed;left:-99999px;width:16px;height:16px;opacity:0;pointer-events:none";
+    video.style.cssText =
+      "position:fixed;left:0;top:0;width:180px;height:320px;opacity:0;pointer-events:none;z-index:-1";
     document.body.appendChild(video);
+    video.addEventListener(
+      "loadeddata",
+      () => {
+        void (async () => {
+          try {
+            await Promise.race([
+              video.play(),
+              new Promise((_, reject) => window.setTimeout(() => reject(new Error("play timeout")), 800)),
+            ]);
+            video.pause();
+          } catch {
+            /* decoder still usable after loadeddata */
+          }
+          video.removeEventListener("error", onError);
+          resolve(video);
+        })();
+      },
+      { once: true },
+    );
     video.load();
   });
 }
