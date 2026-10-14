@@ -1,6 +1,11 @@
 "use client";
 
-import { AUDIO_SAMPLE_RATE, JPEG_MAX_WIDTH, MAX_VERCEL_JSON_BYTES } from "./constants";
+import {
+  AUDIO_SAMPLE_RATE,
+  GEMINI_AUDIO_MIME_BASES,
+  GEMINI_AUDIO_RECORDER_TYPES,
+  JPEG_MAX_WIDTH,
+} from "./constants";
 import { lastSafeTimestamp, planSampleTimestamps } from "./sample-plan";
 import type { AudioInsights, SceneCut, VideoMetadata } from "./types";
 
@@ -151,14 +156,16 @@ export async function detectBrowserSceneCuts(
 export async function extractJpegAtTimestamp(
   video: HTMLVideoElement,
   timestamp: number,
+  options?: { maxWidth?: number; quality?: number },
 ): Promise<ExtractedJpeg> {
   await seekVideo(video, timestamp);
   await waitForVideoFrame(video);
-  let quality = 0.85;
-  let encoded = await canvasToJpeg(video, JPEG_MAX_WIDTH, quality);
-  while (encoded.blob.size > 220_000 && quality > 0.62) {
+  const maxWidth = options?.maxWidth ?? JPEG_MAX_WIDTH;
+  let quality = options?.quality ?? 0.85;
+  let encoded = await canvasToJpeg(video, maxWidth, quality);
+  while (!options?.quality && encoded.blob.size > 220_000 && quality > 0.62) {
     quality -= 0.08;
-    encoded = await canvasToJpeg(video, JPEG_MAX_WIDTH, quality);
+    encoded = await canvasToJpeg(video, maxWidth, quality);
   }
   const base64 = await blobToBase64(encoded.blob);
   return {
@@ -169,6 +176,71 @@ export async function extractJpegAtTimestamp(
     dataUrl: `data:image/jpeg;base64,${base64}`,
     bytes: encoded.blob.size,
   };
+}
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not re-encode a Gemini JPEG."));
+    image.src = src;
+  });
+}
+
+/** Re-encode one Gemini JPEG. Does not mutate the original Roboflow frame. */
+export async function recompressJpeg(
+  frame: ExtractedJpeg,
+  maxWidth: number,
+  quality: number,
+): Promise<ExtractedJpeg> {
+  const image = await loadImage(frame.dataUrl);
+  const scale = Math.min(1, maxWidth / Math.max(image.width, 1));
+  const width = even(image.width * scale);
+  const height = even(image.height * scale);
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not create a 2D canvas to shrink a Gemini JPEG.");
+  ctx.drawImage(image, 0, 0, width, height);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (encoded) => {
+        if (!encoded) {
+          reject(new Error("Canvas failed to re-encode a Gemini JPEG."));
+          return;
+        }
+        resolve(encoded);
+      },
+      "image/jpeg",
+      quality,
+    );
+  });
+  if (blob.size >= frame.bytes && width >= frame.width) return frame;
+  const base64 = await blobToBase64(blob);
+  return {
+    timestamp: frame.timestamp,
+    width,
+    height,
+    base64,
+    dataUrl: `data:image/jpeg;base64,${base64}`,
+    bytes: blob.size,
+  };
+}
+
+export function geminiCompatibleAudioMime(mimeType: string) {
+  const base = mimeType.split(";")[0].trim().toLowerCase();
+  if ((GEMINI_AUDIO_MIME_BASES as readonly string[]).includes(base)) return base;
+  throw new Error(
+    `Encoded audio MIME "${base || mimeType}" is not Gemini-compatible. Complete audio was not sent.`,
+  );
+}
+
+export function supportedCompressedAudioType() {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
+    return null;
+  }
+  return GEMINI_AUDIO_RECORDER_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) || null;
 }
 
 function mixMono(buffer: AudioBuffer) {
@@ -272,12 +344,11 @@ function audioInsightsFromPcm(samples: Float32Array, sampleRate: number, duratio
   };
 }
 
-async function encodeCompressedAudio(samples: Float32Array, sampleRate: number) {
-  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
-  const mimeType = types.find((type) => typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(type));
+export async function encodeCompressedAudio(samples: Float32Array, sampleRate: number) {
+  const mimeType = supportedCompressedAudioType();
   if (!mimeType) {
     throw new Error(
-      "This browser cannot encode compressed audio (MediaRecorder). WAV was too large for Vercel and no fallback codec is available.",
+      "This browser cannot encode Gemini-compatible compressed audio (MediaRecorder Opus/WebM/MP4).",
     );
   }
   const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -312,7 +383,7 @@ async function encodeCompressedAudio(samples: Float32Array, sampleRate: number) 
   if (blob.size < 256) {
     throw new Error("Compressed audio encoding produced an empty file. Complete audio was not captured.");
   }
-  return { blob, mimeType: blob.type || mimeType.split(";")[0] };
+  return { blob, mimeType: geminiCompatibleAudioMime(blob.type || mimeType) };
 }
 
 export async function extractCompleteAudio(file: File, duration: number): Promise<{
@@ -340,27 +411,31 @@ export async function extractCompleteAudio(file: File, duration: number): Promis
   const mixed = mixMono(decoded);
   const samples = await resampleMono(mixed, decoded.sampleRate, AUDIO_SAMPLE_RATE);
   const insights = audioInsightsFromPcm(samples, AUDIO_SAMPLE_RATE, duration);
-  const wav = encodeWav(samples, AUDIO_SAMPLE_RATE);
-  const wavBase64 = await blobToBase64(wav);
-  const wavFits = wav.size * 1.37 < MAX_VERCEL_JSON_BYTES * 0.55;
-  if (wavFits) {
+  try {
+    const compressed = await encodeCompressedAudio(samples, AUDIO_SAMPLE_RATE);
+    const base64 = await blobToBase64(compressed.blob);
+    return {
+      hasAudio: true,
+      mimeType: compressed.mimeType,
+      base64,
+      bytes: compressed.blob.size,
+      insights,
+    };
+  } catch (error) {
+    const wav = encodeWav(samples, AUDIO_SAMPLE_RATE);
+    const base64 = await blobToBase64(wav);
+    const reason = error instanceof Error ? error.message : "Compressed audio encoding failed.";
+    console.info(
+      `[shorts-analyzer] audio fallback WAV ${(wav.size / 1000).toFixed(0)}KB after compressed encode failed: ${reason}`,
+    );
     return {
       hasAudio: true,
       mimeType: "audio/wav",
-      base64: wavBase64,
+      base64,
       bytes: wav.size,
       insights,
     };
   }
-  const compressed = await encodeCompressedAudio(samples, AUDIO_SAMPLE_RATE);
-  const base64 = await blobToBase64(compressed.blob);
-  return {
-    hasAudio: true,
-    mimeType: compressed.mimeType.startsWith("audio/") ? compressed.mimeType : "audio/webm",
-    base64,
-    bytes: compressed.blob.size,
-    insights,
-  };
 }
 
 export async function hashFile(file: File) {

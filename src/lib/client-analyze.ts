@@ -1,10 +1,15 @@
 "use client";
 
-import { MAX_VERCEL_JSON_BYTES } from "./constants";
+import {
+  GEMINI_JPEG_SHRINK_STEPS,
+  GEMINI_MIN_FRAMES,
+  GEMINI_PAYLOAD_BUDGET_BYTES,
+  MAX_VERCEL_JSON_BYTES,
+} from "./constants";
 import { adaptiveFrameTarget, estimateAnalysisCost, toBudgetEvent } from "./cost";
 import { pickGeminiFrames } from "./pick-frames";
-import { httpErrorMessage, jsonByteLength } from "./payload";
-import { preprocessVideo, type ExtractedJpeg } from "./browser-preprocess";
+import { httpErrorMessage, jsonByteLength, logGeminiPayload } from "./payload";
+import { preprocessVideo, recompressJpeg, type ExtractedJpeg } from "./browser-preprocess";
 import type { AnalysisResult, BudgetEstimate, FrameDetections, ProgressEvent } from "./types";
 
 export type AnalyzerStatus = {
@@ -224,15 +229,8 @@ export async function runBrowserAnalysis(input: {
     ...prepared.sceneCuts.map((cut) => cut.timestamp),
     prepared.metadata.duration,
   ];
-  const geminiJpegs = pickGeminiFrames(prepared.frames, geminiFrameCount, extras);
 
-  emit({
-    type: "stage",
-    stage: "analyzing_story",
-    message: `Gemini ${input.status.geminiModel ?? "gemini-2.5-flash"}: ${geminiJpegs.length} frames plus complete audio`,
-  });
-
-  const geminiBody = {
+  const buildGeminiBody = (frames: ExtractedJpeg[]) => ({
     sessionId,
     fileHash: prepared.fileHash,
     force: input.force,
@@ -240,7 +238,7 @@ export async function runBrowserAnalysis(input: {
     caption: input.caption,
     video: prepared.metadata,
     detections,
-    geminiFrames: geminiJpegs.map((frame) => ({
+    geminiFrames: frames.map((frame) => ({
       timestamp: frame.timestamp,
       imageBase64: frame.base64,
       width: frame.width,
@@ -256,7 +254,56 @@ export async function runBrowserAnalysis(input: {
       : ["This file has no audio track. Format and hook comments will be visual-only."],
     roboflowBilled: billed,
     roboflowCached: cached,
-  };
+  });
+
+  let geminiCount = geminiFrameCount;
+  let shrinkStep = -1;
+  let geminiJpegs = pickGeminiFrames(prepared.frames, geminiCount, extras);
+  let geminiBody = buildGeminiBody(geminiJpegs);
+  let payloadInfo = logGeminiPayload("Gemini request before fit", geminiBody);
+
+  while (payloadInfo.jsonBytes > GEMINI_PAYLOAD_BUDGET_BYTES) {
+    if (shrinkStep + 1 < GEMINI_JPEG_SHRINK_STEPS.length) {
+      shrinkStep += 1;
+      const step = GEMINI_JPEG_SHRINK_STEPS[shrinkStep];
+      emit({
+        type: "stage",
+        stage: "analyzing_story",
+        message: `Gemini payload ${(payloadInfo.jsonBytes / 1_000_000).toFixed(2)}MB; shrinking Gemini JPEGs to ${step.maxWidth}px`,
+      });
+      geminiJpegs = await Promise.all(
+        pickGeminiFrames(prepared.frames, geminiCount, extras).map((frame) =>
+          recompressJpeg(frame, step.maxWidth, step.quality),
+        ),
+      );
+    } else if (geminiCount > GEMINI_MIN_FRAMES) {
+      geminiCount = Math.max(GEMINI_MIN_FRAMES, geminiCount - 2);
+      const step = GEMINI_JPEG_SHRINK_STEPS[GEMINI_JPEG_SHRINK_STEPS.length - 1];
+      emit({
+        type: "stage",
+        stage: "analyzing_story",
+        message: `Gemini payload still ${(payloadInfo.jsonBytes / 1_000_000).toFixed(2)}MB; sending ${geminiCount} Gemini frames`,
+      });
+      geminiJpegs = await Promise.all(
+        pickGeminiFrames(prepared.frames, geminiCount, extras).map((frame) =>
+          recompressJpeg(frame, step.maxWidth, step.quality),
+        ),
+      );
+    } else {
+      const audioMb = ((prepared.audio.bytes || 0) / 1_000_000).toFixed(2);
+      throw new Error(
+        `Gemini request is ${(payloadInfo.jsonBytes / 1_000_000).toFixed(2)}MB after shrinking frames. Complete audio (${prepared.audio.mimeType || "unknown"}, ${audioMb}MB) was not dropped. Use a shorter Short or a browser that can encode Opus/WebM/MP4 audio.`,
+      );
+    }
+    geminiBody = buildGeminiBody(geminiJpegs);
+    payloadInfo = logGeminiPayload("Gemini request after fit step", geminiBody);
+  }
+
+  emit({
+    type: "stage",
+    stage: "analyzing_story",
+    message: `Gemini ${input.status.geminiModel ?? "gemini-2.5-flash"}: ${geminiJpegs.length} frames plus complete ${prepared.audio.mimeType || "audio"}`,
+  });
 
   const geminiResponse = await postJson<{ result: AnalysisResult }>("/api/gemini", geminiBody, "Gemini request");
   const byTime = new Map(prepared.frames.map((frame) => [frame.timestamp.toFixed(3), frame]));
@@ -275,7 +322,7 @@ export async function runBrowserAnalysis(input: {
       ...geminiResponse.result.usage,
       notes: [
         ...(geminiResponse.result.usage.notes || []),
-        `Browser extracted ${prepared.frames.length} JPEGs (target ${adaptiveFrameTarget(prepared.metadata.duration, minFrames, maxFrames)}). Audio ${prepared.audio.mimeType || "none"} ${prepared.audio.bytes ? `${(prepared.audio.bytes / 1000).toFixed(0)}KB` : ""}`.trim(),
+        `Browser extracted ${prepared.frames.length} JPEGs (target ${adaptiveFrameTarget(prepared.metadata.duration, minFrames, maxFrames)}). Gemini ${geminiJpegs.length} frames. Audio ${prepared.audio.mimeType || "none"} ${prepared.audio.bytes ? `${(prepared.audio.bytes / 1000).toFixed(0)}KB` : ""}. Payload ${(payloadInfo.jsonBytes / 1_000_000).toFixed(2)}MB.`.trim(),
       ],
     },
   };

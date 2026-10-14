@@ -3,7 +3,7 @@ import { estimateAnalysisCost, toBudgetEvent, usdFromTokens } from "@/lib/cost";
 import { detectionDigest } from "@/lib/detection-digest";
 import { geminiCacheKey, readGeminiCache, writeGeminiCache } from "@/lib/inference-cache";
 import { MAX_VERCEL_JSON_BYTES } from "@/lib/constants";
-import { assertUnderVercelLimit } from "@/lib/payload";
+import { assertUnderVercelLimit, logGeminiPayload } from "@/lib/payload";
 import { QuotaError } from "@/lib/roboflow";
 import { analyzeStory } from "@/lib/story-analysis";
 import { isReusableGeminiCache } from "@/lib/video-format";
@@ -52,11 +52,11 @@ export async function POST(request: Request) {
       },
       "Gemini request metadata",
     );
-    const bytes = new TextEncoder().encode(JSON.stringify(body)).length;
-    if (bytes > MAX_VERCEL_JSON_BYTES) {
+    const payloadInfo = logGeminiPayload("POST /api/gemini", body);
+    if (payloadInfo.jsonBytes > MAX_VERCEL_JSON_BYTES) {
       return Response.json(
         {
-          message: `Gemini request is ${(bytes / 1_000_000).toFixed(2)}MB, over the Vercel Hobby 4.5MB limit.`,
+          message: `Gemini request is ${(payloadInfo.jsonBytes / 1_000_000).toFixed(2)}MB, over the Vercel Hobby 4.5MB limit.`,
         },
         { status: 413 },
       );

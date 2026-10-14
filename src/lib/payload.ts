@@ -1,5 +1,29 @@
 import { MAX_VERCEL_JSON_BYTES } from "./constants";
 
+export type GeminiPayloadLike = {
+  audio?: { mimeType?: string; data?: string } | null;
+  geminiFrames?: Array<{ imageBase64?: string }>;
+};
+
+export function geminiPayloadDiagnostics(body: GeminiPayloadLike) {
+  const frames = body.geminiFrames || [];
+  return {
+    jsonBytes: jsonByteLength(body),
+    audioMime: body.audio?.mimeType || "none",
+    audioBase64Chars: body.audio?.data?.length ?? 0,
+    geminiFrameCount: frames.length,
+    geminiFrameBase64Chars: frames.reduce((sum, frame) => sum + (frame.imageBase64?.length ?? 0), 0),
+  };
+}
+
+export function logGeminiPayload(label: string, body: GeminiPayloadLike) {
+  const info = geminiPayloadDiagnostics(body);
+  console.info(
+    `[shorts-analyzer] ${label}: JSON ${(info.jsonBytes / 1_000_000).toFixed(2)}MB, audio ${info.audioMime} ${(info.audioBase64Chars / 1000).toFixed(0)}k chars, ${info.geminiFrameCount} Gemini JPEGs ${(info.geminiFrameBase64Chars / 1000).toFixed(0)}k chars`,
+  );
+  return info;
+}
+
 export function jsonByteLength(value: unknown) {
   return new TextEncoder().encode(JSON.stringify(value)).length;
 }
